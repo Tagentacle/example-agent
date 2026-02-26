@@ -1,0 +1,12 @@
+[package]
+name = "example_agent"
+version = "0.1.0"
+description = "Example AI Agent node that calls MCP tools over the Tagentacle bus"
+authors = ["Tagentacle Contributors"]
+type = "executable"
+
+[entry_points]
+node = "client:main"
+
+[dependencies]
+python = ["mcp", "anyio"]
