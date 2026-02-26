@@ -221,8 +221,8 @@ dependencies = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.0" },
     { name = "mcp", specifier = ">=1.0" },
-    { name = "tagentacle-py-core", git = "https://github.com/Tagentacle/python-sdk-core.git?branch=main" },
-    { name = "tagentacle-py-mcp", git = "https://github.com/Tagentacle/python-sdk-mcp.git?branch=main" },
+    { name = "tagentacle-py-core", editable = "../python-sdk-core" },
+    { name = "tagentacle-py-mcp", editable = "../python-sdk-mcp" },
 ]
 
 [[package]]
@@ -719,16 +719,23 @@ wheels = [
 [[package]]
 name = "tagentacle-py-core"
 version = "0.1.0"
-source = { git = "https://github.com/Tagentacle/python-sdk-core.git?branch=main#f0c9e6e4240f7291ce55e690e6a6d881621778e7" }
+source = { editable = "../python-sdk-core" }
 
 [[package]]
 name = "tagentacle-py-mcp"
 version = "0.1.0"
-source = { git = "https://github.com/Tagentacle/python-sdk-mcp.git?branch=main#d6d24f0dc621f9407494d6989eed5f56679738f7" }
+source = { editable = "../python-sdk-mcp" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp" },
     { name = "tagentacle-py-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.0" },
+    { name = "mcp", specifier = ">=1.0" },
+    { name = "tagentacle-py-core", editable = "../python-sdk-core" },
 ]
 
 [[package]]

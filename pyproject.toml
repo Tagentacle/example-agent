@@ -11,5 +11,5 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-tagentacle-py-core = { git = "https://github.com/Tagentacle/python-sdk-core.git", branch = "main" }
-tagentacle-py-mcp = { git = "https://github.com/Tagentacle/python-sdk-mcp.git", branch = "main" }
+tagentacle-py-core = { path = "../python-sdk-core", editable = true }
+tagentacle-py-mcp = { path = "../python-sdk-mcp", editable = true }
