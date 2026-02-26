@@ -4,6 +4,12 @@ version = "0.1.0"
 description = "Example AI Agent node for Tagentacle"
 requires-python = ">=3.10"
 dependencies = [
+    "tagentacle-py-core>=0.1.0",
+    "tagentacle-py-mcp>=0.1.0",
     "mcp>=1.0",
     "anyio>=4.0",
 ]
+
+[tool.uv.sources]
+tagentacle-py-core = { git = "https://github.com/Tagentacle/python-sdk-core.git", branch = "main" }
+tagentacle-py-mcp = { git = "https://github.com/Tagentacle/python-sdk-mcp.git", branch = "main" }
