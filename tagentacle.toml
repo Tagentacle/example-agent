@@ -1,7 +1,7 @@
 [package]
 name = "example_agent"
 version = "0.1.0"
-description = "Example AI Agent node that calls MCP tools over the Tagentacle bus"
+description = "Chatbot Agent with full agentic loop, MCP tool use, and LLM inference"
 authors = ["Tagentacle Contributors"]
 type = "executable"
 
