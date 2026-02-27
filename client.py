@@ -5,16 +5,14 @@ This Agent Node owns the complete agentic loop:
   1. Subscribe /chat/input → receive user messages
   2. Manage context window (messages array)
   3. Call /inference/chat Service for LLM completion
-  4. Parse tool_calls → execute via MCP Transport → backfill results → re-infer
+  4. Parse tool_calls → execute via MCP HTTP session → backfill results → re-infer
   5. Publish final reply to /chat/output
   6. Publish memory state to /memory/latest on every update
 
-Data flow:
-    /chat/input ──▶ Agent (agentic loop)
-                      ├─ call_service("/inference/chat") ──▶ Inference Node
-                      ├─ MCP session.call_tool()         ──▶ MCP Server Node
-                      ├─ publish /chat/output             ──▶ Frontend Node
-                      └─ publish /memory/latest           ──▶ Memory Node + Frontend
+MCP Server discovery:
+  - Subscribes to /mcp/directory Topic to discover available servers
+  - Connects to servers via native MCP SDK Streamable HTTP client
+  - No bus-as-transport — direct HTTP connection to MCP servers
 """
 
 import asyncio
@@ -26,7 +24,7 @@ from typing import Any
 
 from tagentacle_py_core import LifecycleNode
 from mcp import ClientSession
-from tagentacle_py_mcp.transport import tagentacle_client_transport
+from mcp.client.streamable_http import streamable_http_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,37 +82,86 @@ class ChatbotAgent(LifecycleNode):
         self._mcp_task: asyncio.Task | None = None
         self._mcp_ready = asyncio.Event()
         self._processing = False  # Guard against concurrent agentic loops
+        self._server_urls: dict[str, str] = {}  # server_id → url
+        self._target_server: str | None = None  # server_id to connect to
 
     def on_configure(self, config: dict):
         """Initialize agent configuration."""
         self.model = config.get("model", DEFAULT_MODEL)
         if "system_prompt" in config:
             self.system_prompt = config["system_prompt"]
+        self._target_server = config.get("mcp_server_id")
         # Initialize with system message
         self.messages = [{"role": "system", "content": self.system_prompt}]
         logger.info(f"Agent configured: model={self.model}, session={self.session_id}")
 
     async def on_activate(self):
-        """Register subscriptions and establish MCP session."""
+        """Register subscriptions and discover MCP servers."""
         # Subscribe to user input
         @self.subscribe("/chat/input")
         async def on_user_input(msg: dict):
             await self._on_user_message(msg)
 
-        # Start MCP session in background task (keeps context manager alive)
-        self._mcp_task = asyncio.create_task(self._run_mcp_session())
+        # Subscribe to /mcp/directory for server discovery
+        @self.subscribe("/mcp/directory")
+        async def on_mcp_directory(msg: dict):
+            await self._on_directory_update(msg)
 
-        # Wait for MCP session to be ready
-        try:
-            await asyncio.wait_for(self._mcp_ready.wait(), timeout=15)
-            logger.info(f"Agent activated. Tools: {[t['function']['name'] for t in self.openai_tools]}")
-        except asyncio.TimeoutError:
-            logger.warning("MCP session not ready within 15s — agent will work without tools")
+        # Try to connect to a known server URL (from env or config)
+        server_url = os.environ.get("MCP_SERVER_URL")
+        if server_url:
+            self._mcp_task = asyncio.create_task(
+                self._connect_mcp(server_url)
+            )
 
-    async def _run_mcp_session(self):
-        """Maintain MCP client session for the lifetime of the node."""
+            try:
+                await asyncio.wait_for(self._mcp_ready.wait(), timeout=15)
+                logger.info(
+                    "Agent activated. Tools: %s",
+                    [t["function"]["name"] for t in self.openai_tools],
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MCP session not ready within 15s — "
+                    "agent will connect when a server appears on /mcp/directory"
+                )
+        else:
+            logger.info(
+                "No MCP_SERVER_URL set — agent will connect when a "
+                "server appears on /mcp/directory"
+            )
+
+    async def _on_directory_update(self, msg: dict):
+        """Handle /mcp/directory messages for server discovery."""
+        payload = msg.get("payload", {})
+        server_id = payload.get("server_id")
+        url = payload.get("url")
+        status = payload.get("status")
+
+        if not server_id:
+            return
+
+        if status == "available" and url:
+            self._server_urls[server_id] = url
+            logger.info("Discovered MCP server: %s at %s", server_id, url)
+
+            # Auto-connect if we don't have a session yet
+            if not self._mcp_session and not self._mcp_task:
+                # Connect to target server or first available
+                if self._target_server is None or server_id == self._target_server:
+                    logger.info("Auto-connecting to MCP server: %s", server_id)
+                    self._mcp_task = asyncio.create_task(
+                        self._connect_mcp(url)
+                    )
+
+        elif status == "unavailable":
+            self._server_urls.pop(server_id, None)
+            logger.info("MCP server unavailable: %s", server_id)
+
+    async def _connect_mcp(self, url: str):
+        """Connect to an MCP server via Streamable HTTP."""
         try:
-            async with tagentacle_client_transport(self, server_node_id="mcp_server_node") as (read_stream, write_stream):
+            async with streamable_http_client(url) as (read_stream, write_stream, _get_session_id):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
                     self._mcp_session = session
@@ -122,7 +169,10 @@ class ChatbotAgent(LifecycleNode):
                     # Discover tools and convert to OpenAI schema
                     tools_result = await session.list_tools()
                     self.openai_tools = mcp_tools_to_openai_schema(tools_result.tools)
-                    logger.info(f"MCP tools discovered: {[t.name for t in tools_result.tools]}")
+                    logger.info(
+                        "MCP tools discovered: %s",
+                        [t.name for t in tools_result.tools],
+                    )
 
                     # Signal ready
                     self._mcp_ready.set()
@@ -133,8 +183,11 @@ class ChatbotAgent(LifecycleNode):
                     except asyncio.CancelledError:
                         pass
         except Exception as e:
-            logger.error(f"MCP session error: {e}")
+            logger.error("MCP connection error: %s", e)
             self._mcp_ready.set()  # Unblock activation even on failure
+        finally:
+            self._mcp_session = None
+            self._mcp_task = None
 
     async def _on_user_message(self, msg: dict):
         """Handle incoming user message from /chat/input."""
@@ -294,17 +347,8 @@ class ChatbotAgent(LifecycleNode):
 
 async def main():
     agent = ChatbotAgent()
-    await agent.connect()
-
-    # Start spin BEFORE lifecycle transitions so that
-    # on_activate()'s MCP session can exchange messages via the bus.
-    spin_task = asyncio.create_task(agent.spin())
-
-    await agent.configure()
-    await agent.activate()
-
-    # spin() is already running — just await it
-    await spin_task
+    await agent.bringup()
+    await agent.spin()
 
 
 if __name__ == "__main__":

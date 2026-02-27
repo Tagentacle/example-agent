@@ -1,15 +1,13 @@
 [project]
 name = "example-agent"
-version = "0.1.0"
+version = "0.2.0"
 description = "Example AI Agent node for Tagentacle"
 requires-python = ">=3.10"
 dependencies = [
     "tagentacle-py-core>=0.1.0",
-    "tagentacle-py-mcp>=0.1.0",
-    "mcp>=1.0",
-    "anyio>=4.0",
+    "mcp>=1.8",
+    "httpx>=0.24",
 ]
 
 [tool.uv.sources]
 tagentacle-py-core = { path = "../python-sdk-core", editable = true }
-tagentacle-py-mcp = { path = "../python-sdk-mcp", editable = true }
