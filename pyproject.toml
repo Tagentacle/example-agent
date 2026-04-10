@@ -10,4 +10,4 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-tagentacle-py-core = { path = "../python-sdk-core", editable = true }
+tagentacle-py-core = { path = "../tagentacle-py-core", editable = true }
