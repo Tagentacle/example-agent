@@ -98,10 +98,13 @@ class AgentNode(LifecycleNode):
     The agent NEVER writes business logic in bus callbacks.
     All callbacks do one thing: push to inbox.  InferenceMux controls
     when to drain the inbox and run an inference cycle.
+
+    Supports multiple instances via config:
+      node_id, input_topic, output_topic, system_prompt
     """
 
-    def __init__(self):
-        super().__init__("agent_node")
+    def __init__(self, node_id: str = "agent_node"):
+        super().__init__(node_id)
         self.inbox = Inbox()
         self.mux = InferenceMux()
 
@@ -110,6 +113,11 @@ class AgentNode(LifecycleNode):
         self.session_id: str = str(uuid.uuid4())[:8]
         self.model: str = DEFAULT_MODEL
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
+
+        # Topics (configurable for multi-agent)
+        self._input_topic: str = "/chat/input"
+        self._output_topic: str = "/chat/output"
+        self._extra_subscribe: list[str] = []
 
         # MCP client state
         self.openai_tools: list[dict] = []
@@ -127,12 +135,24 @@ class AgentNode(LifecycleNode):
         self.model = config.get("model", DEFAULT_MODEL)
         if "system_prompt" in config:
             self.system_prompt = config["system_prompt"]
+        if "input_topic" in config:
+            self._input_topic = config["input_topic"]
+        if "output_topic" in config:
+            self._output_topic = config["output_topic"]
+        if "extra_subscribe" in config:
+            self._extra_subscribe = config["extra_subscribe"]
         self._target_server = config.get("mcp_server_id")
-        logger.info("Agent configured: model=%s session=%s", self.model, self.session_id)
+        logger.info("Agent configured: model=%s session=%s input=%s output=%s",
+                     self.model, self.session_id,
+                     self._input_topic, self._output_topic)
 
     async def on_activate(self):
         # Mailbox subscription — callback only pushes to inbox
-        self._subscribe_mailbox("/chat/input", TopicMode.FOLLOWUP)
+        self._subscribe_mailbox(self._input_topic, TopicMode.FOLLOWUP)
+
+        # Extra subscriptions (e.g. /agent/b/output for cross-agent communication)
+        for topic in self._extra_subscribe:
+            self._subscribe_mailbox(topic, TopicMode.FOLLOWUP)
 
         # Infrastructure subscription — not in inbox, handled directly
         @self.subscribe("/mcp/directory")
@@ -239,7 +259,7 @@ class AgentNode(LifecycleNode):
                 await self._run_inference_cycle(signal)
             except Exception as e:
                 logger.error("Inference cycle error: %s", e, exc_info=True)
-                await self.publish("/chat/output", {
+                await self.publish(self._output_topic, {
                     "text": f"⚠️ Error: {e}",
                     "session_id": self.session_id,
                 })
@@ -260,7 +280,7 @@ class AgentNode(LifecycleNode):
         # --- Phase 2: extract user messages ---
         other_notifs = []
         for n in notifications:
-            if n.get("topic") == "/chat/input":
+            if n.get("topic") == self._input_topic:
                 text = n.get("payload", {}).get("text", "").strip()
                 if text:
                     self.messages.append({"role": "user", "content": text})
@@ -300,7 +320,7 @@ class AgentNode(LifecycleNode):
                 # --- Phase 4: final reply ---
                 content = assistant_msg.get("content", "")
                 logger.info("Reply (round %d): %.80s...", round_num + 1, content)
-                await self.publish("/chat/output", {
+                await self.publish(self._output_topic, {
                     "text": content,
                     "session_id": self.session_id,
                 })
@@ -325,7 +345,7 @@ class AgentNode(LifecycleNode):
                 })
 
         # Safety: exceeded max rounds
-        await self.publish("/chat/output", {
+        await self.publish(self._output_topic, {
             "text": "⚠️ Exceeded maximum tool call rounds.",
             "session_id": self.session_id,
         })
@@ -345,8 +365,30 @@ class AgentNode(LifecycleNode):
 
 
 async def main():
-    agent = AgentNode()
-    await agent.bringup()
+    node_id = os.environ.get("AGENT_ID", "agent_node")
+    agent = AgentNode(node_id=node_id)
+
+    # Build config from environment for multi-agent support
+    config: dict = {}
+    if os.environ.get("AGENT_ROLE"):
+        role = os.environ["AGENT_ROLE"]
+        if role == "executor":
+            config.setdefault("input_topic", "/agent/b/input")
+            config.setdefault("output_topic", "/agent/b/output")
+            config.setdefault("extra_subscribe", ["/agent/a/output"])
+            config.setdefault("system_prompt",
+                "You are Agent B, an executor. You receive tasks from Agent A "
+                "and execute them using available tools. Report results back. "
+                "Always respond in the same language as the input.")
+        elif role == "coordinator":
+            config.setdefault("extra_subscribe", ["/agent/b/output"])
+            config.setdefault("system_prompt",
+                "You are Agent A, a coordinator. You receive user requests and "
+                "can delegate tasks to Agent B by publishing to /agent/b/input. "
+                "You have access to tools. Always respond in the same language "
+                "as the user.")
+
+    await agent.bringup(config)
     await agent.spin()
 
 
