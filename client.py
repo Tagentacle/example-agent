@@ -1,18 +1,22 @@
 """
-Tagentacle Chatbot Agent: Full Agentic Loop with MCP Tool Use.
+Tagentacle AgentNode — mailbox-based agentic loop.
 
-This Agent Node owns the complete agentic loop:
-  1. Subscribe /chat/input → receive user messages
-  2. Manage context window (messages array)
-  3. Call /inference/chat Service for LLM completion
-  4. Parse tool_calls → execute via MCP HTTP session → backfill results → re-infer
-  5. Publish final reply to /chat/output
-  6. Publish memory state to /memory/latest on every update
+Architecture (new_agent_node.md / Q27 邮箱模型):
+  Inbox (core): per-topic message buffer — callbacks only push, no logic
+  InferenceMux (inferencemux): IDLE/BUSY state machine + followup queue
+  MCP Client: connects to external MCP servers for tool execution
+  build_context(): pure function — messages + notifications → LLM context
+  _run_inference_cycle(): the sole orchestrator
+
+Data flow:
+  bus message → subscribe callback → inbox.push()
+    → mux.trigger() → _run_inference_cycle()
+    → inbox.drain() → build_context() → call_service(/inference/chat)
+    → tool_calls (MCP) → publish(/chat/output)
 
 MCP Server discovery:
-  - Subscribes to /mcp/directory Topic to discover available servers
-  - Connects to servers via native MCP SDK Streamable HTTP client
-  - No bus-as-transport — direct HTTP connection to MCP servers
+  Subscribes to /mcp/directory (infrastructure, not in inbox).
+  Connects to servers via native MCP SDK Streamable HTTP client.
 """
 
 import asyncio
@@ -20,119 +24,161 @@ import json
 import logging
 import os
 import uuid
-from typing import Any
 
-from tagentacle_py_core import LifecycleNode
+from tagentacle_py_core import LifecycleNode, Inbox, TopicMode
+from tagentacle_py_inferencemux import InferenceMux, TriggerSignal
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Default configuration ---
+# --- Configuration defaults ---
 DEFAULT_MODEL = os.environ.get("INFERENCE_MODEL", "moonshotai/kimi-k2.5")
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant. You have access to tools that you can use "
     "to help answer questions. When a user asks about the weather, use the "
     "get_weather tool. Always respond in the same language as the user."
 )
-MAX_TOOL_ROUNDS = 10  # Safety: max consecutive tool-call rounds
+MAX_TOOL_ROUNDS = 10
+
+
+# --- Utilities ---
 
 
 def mcp_tools_to_openai_schema(mcp_tools) -> list[dict]:
-    """Convert MCP Tool objects to OpenAI function-calling tool schema.
-
-    MCP's inputSchema IS JSON Schema — same format as OpenAI's function
-    parameters. This conversion is trivial.
-
-    Args:
-        mcp_tools: List of mcp.types.Tool objects from session.list_tools()
-
-    Returns:
-        List of OpenAI tool dicts: [{"type": "function", "function": {...}}, ...]
-    """
-    openai_tools = []
+    """Convert MCP Tool objects to OpenAI function-calling tool schema."""
+    result = []
     for tool in mcp_tools:
-        schema = tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}}
-        # Ensure 'properties' key exists (OpenAI requires it)
+        schema = tool.inputSchema or {"type": "object", "properties": {}}
         if "properties" not in schema:
             schema["properties"] = {}
-        openai_tools.append({
+        result.append({
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description or "",
                 "parameters": schema,
-            }
+            },
         })
-    return openai_tools
+    return result
 
 
-class ChatbotAgent(LifecycleNode):
-    """Full agentic loop chatbot with MCP tool integration."""
+def build_context(
+    system_prompt: str,
+    messages: list[dict],
+    notifications: list[dict],
+) -> list[dict]:
+    """Pure function: render LLM context from conversation + notifications.
+
+    Notifications (new inbox items since last cycle) are injected as a system
+    message so the LLM sees ambient information without explicit user input.
+    """
+    ctx = [{"role": "system", "content": system_prompt}]
+    ctx.extend(messages)
+    if notifications:
+        parts = []
+        for n in notifications:
+            topic = n.get("topic", "?")
+            payload = {k: v for k, v in n.items() if k not in ("topic", "ts")}
+            parts.append(f"[{topic}] {json.dumps(payload, ensure_ascii=False)}")
+        ctx.append({
+            "role": "system",
+            "content": "New bus notifications:\n" + "\n".join(parts),
+        })
+    return ctx
+
+
+# --- AgentNode ---
+
+
+class AgentNode(LifecycleNode):
+    """Mailbox-based agent with InferenceMux trigger control.
+
+    The agent NEVER writes business logic in bus callbacks.
+    All callbacks do one thing: push to inbox.  InferenceMux controls
+    when to drain the inbox and run an inference cycle.
+    """
 
     def __init__(self):
         super().__init__("agent_node")
+        self.inbox = Inbox()
+        self.mux = InferenceMux()
+
+        # Conversation state
         self.messages: list[dict] = []
         self.session_id: str = str(uuid.uuid4())[:8]
         self.model: str = DEFAULT_MODEL
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
+
+        # MCP client state
         self.openai_tools: list[dict] = []
-        self._mcp_session: ClientSession | None = None
-        self._mcp_task: asyncio.Task | None = None
-        self._mcp_ready = asyncio.Event()
-        self._processing = False  # Guard against concurrent agentic loops
-        self._server_urls: dict[str, str] = {}  # server_id → url
-        self._target_server: str | None = None  # server_id to connect to
+        self._mcp_sessions: dict[str, ClientSession] = {}
+        self._mcp_tasks: list[asyncio.Task] = []
+        self._server_urls: dict[str, str] = {}
+        self._target_server: str | None = None
+        self._inference_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def on_configure(self, config: dict):
-        """Initialize agent configuration."""
         self.model = config.get("model", DEFAULT_MODEL)
         if "system_prompt" in config:
             self.system_prompt = config["system_prompt"]
         self._target_server = config.get("mcp_server_id")
-        # Initialize with system message
-        self.messages = [{"role": "system", "content": self.system_prompt}]
-        logger.info(f"Agent configured: model={self.model}, session={self.session_id}")
+        logger.info("Agent configured: model=%s session=%s", self.model, self.session_id)
 
     async def on_activate(self):
-        """Register subscriptions and discover MCP servers."""
-        # Subscribe to user input
-        @self.subscribe("/chat/input")
-        async def on_user_input(msg: dict):
-            await self._on_user_message(msg)
+        # Mailbox subscription — callback only pushes to inbox
+        self._subscribe_mailbox("/chat/input", TopicMode.FOLLOWUP)
 
-        # Subscribe to /mcp/directory for server discovery
+        # Infrastructure subscription — not in inbox, handled directly
         @self.subscribe("/mcp/directory")
-        async def on_mcp_directory(msg: dict):
-            await self._on_directory_update(msg)
+        async def _on_directory(msg):
+            await self._handle_directory(msg)
 
-        # Try to connect to a known server URL (from env or config)
+        # Auto-connect from env
         server_url = os.environ.get("MCP_SERVER_URL")
         if server_url:
-            self._mcp_task = asyncio.create_task(
-                self._connect_mcp(server_url)
-            )
+            self._start_mcp_session("env_server", server_url)
 
-            try:
-                await asyncio.wait_for(self._mcp_ready.wait(), timeout=15)
-                logger.info(
-                    "Agent activated. Tools: %s",
-                    [t["function"]["name"] for t in self.openai_tools],
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP session not ready within 15s — "
-                    "agent will connect when a server appears on /mcp/directory"
-                )
-        else:
-            logger.info(
-                "No MCP_SERVER_URL set — agent will connect when a "
-                "server appears on /mcp/directory"
-            )
+        # Start inference loop
+        self._inference_task = asyncio.create_task(self._inference_loop())
+        logger.info("AgentNode activated — waiting for messages")
 
-    async def _on_directory_update(self, msg: dict):
-        """Handle /mcp/directory messages for server discovery."""
+    async def on_shutdown(self):
+        if self._inference_task:
+            self._inference_task.cancel()
+        for t in self._mcp_tasks:
+            t.cancel()
+        logger.info("AgentNode shut down.")
+
+    # ------------------------------------------------------------------
+    # Mailbox wiring
+    # ------------------------------------------------------------------
+
+    def _subscribe_mailbox(self, topic: str, mode: TopicMode):
+        """Subscribe to a bus topic using the mailbox pattern.
+
+        The callback does exactly ONE thing: push to inbox.
+        If mode is FOLLOWUP, it also triggers InferenceMux.
+        """
+        self.inbox.set_mode(topic, mode)
+
+        @self.subscribe(topic)
+        async def _on_message(msg, _topic=topic):
+            should_trigger = self.inbox.push(_topic, msg)
+            if should_trigger:
+                await self.mux.trigger(TriggerSignal(topic=_topic))
+
+    # ------------------------------------------------------------------
+    # MCP server discovery + connection
+    # ------------------------------------------------------------------
+
+    async def _handle_directory(self, msg: dict):
+        """Process /mcp/directory for auto-discovery."""
         payload = msg.get("payload", {})
         server_id = payload.get("server_id")
         url = payload.get("url")
@@ -140,213 +186,166 @@ class ChatbotAgent(LifecycleNode):
 
         if not server_id:
             return
-
-        if status == "available" and url:
-            self._server_urls[server_id] = url
-            logger.info("Discovered MCP server: %s at %s", server_id, url)
-
-            # Auto-connect if we don't have a session yet
-            if not self._mcp_session and not self._mcp_task:
-                # Connect to target server or first available
-                if self._target_server is None or server_id == self._target_server:
-                    logger.info("Auto-connecting to MCP server: %s", server_id)
-                    self._mcp_task = asyncio.create_task(
-                        self._connect_mcp(url)
-                    )
-
+        if status == "available" and url and server_id not in self._mcp_sessions:
+            if self._target_server is None or server_id == self._target_server:
+                self._server_urls[server_id] = url
+                self._start_mcp_session(server_id, url)
+                logger.info("Discovered MCP server: %s at %s", server_id, url)
         elif status == "unavailable":
             self._server_urls.pop(server_id, None)
-            logger.info("MCP server unavailable: %s", server_id)
+            self._mcp_sessions.pop(server_id, None)
 
-    async def _connect_mcp(self, url: str):
-        """Connect to an MCP server via Streamable HTTP."""
-        try:
-            async with streamable_http_client(url) as (read_stream, write_stream, _get_session_id):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    self._mcp_session = session
+    def _start_mcp_session(self, server_id: str, url: str):
+        """Start an MCP client session in the background."""
+        async def _loop():
+            try:
+                async with streamable_http_client(url) as (r, w, _):
+                    async with ClientSession(r, w) as session:
+                        await session.initialize()
+                        self._mcp_sessions[server_id] = session
+                        await self._refresh_tools()
+                        logger.info("MCP ready: %s (%d tools)",
+                                    server_id, len(self.openai_tools))
+                        await asyncio.Future()  # keep alive
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("MCP error (%s): %s", server_id, e)
+            finally:
+                self._mcp_sessions.pop(server_id, None)
 
-                    # Discover tools and convert to OpenAI schema
-                    tools_result = await session.list_tools()
-                    self.openai_tools = mcp_tools_to_openai_schema(tools_result.tools)
-                    logger.info(
-                        "MCP tools discovered: %s",
-                        [t.name for t in tools_result.tools],
-                    )
+        self._mcp_tasks.append(asyncio.create_task(_loop()))
 
-                    # Signal ready
-                    self._mcp_ready.set()
+    async def _refresh_tools(self):
+        """Collect tools from all connected MCP sessions."""
+        all_tools = []
+        for session in self._mcp_sessions.values():
+            try:
+                result = await session.list_tools()
+                all_tools.extend(mcp_tools_to_openai_schema(result.tools))
+            except Exception:
+                pass
+        self.openai_tools = all_tools
 
-                    # Keep session alive until cancelled
-                    try:
-                        await asyncio.Future()  # Block forever
-                    except asyncio.CancelledError:
-                        pass
-        except Exception as e:
-            logger.error("MCP connection error: %s", e)
-            self._mcp_ready.set()  # Unblock activation even on failure
-        finally:
-            self._mcp_session = None
-            self._mcp_task = None
+    # ------------------------------------------------------------------
+    # Inference loop — the core of the agent
+    # ------------------------------------------------------------------
 
-    async def _on_user_message(self, msg: dict):
-        """Handle incoming user message from /chat/input."""
-        payload = msg.get("payload", {})
-        user_text = payload.get("text", "").strip()
-        session_id = payload.get("session_id")
+    async def _inference_loop(self):
+        """Wait for mux trigger → run inference cycle → release → repeat."""
+        while True:
+            signal = await self.mux.wait()
+            try:
+                await self._run_inference_cycle(signal)
+            except Exception as e:
+                logger.error("Inference cycle error: %s", e, exc_info=True)
+                await self.publish("/chat/output", {
+                    "text": f"⚠️ Error: {e}",
+                    "session_id": self.session_id,
+                })
+            finally:
+                self.mux.release()
 
-        if not user_text:
+    async def _run_inference_cycle(self, trigger: TriggerSignal):
+        """One complete inference cycle — the sole orchestrator.
+
+        Phase 1: Drain inbox (take all buffered messages)
+        Phase 2: Extract user input → append to conversation
+        Phase 3: Inference + tool loop
+        Phase 4: Publish final reply
+        """
+        # --- Phase 1: drain inbox ---
+        notifications = self.inbox.drain()
+
+        # --- Phase 2: extract user messages ---
+        other_notifs = []
+        for n in notifications:
+            if n.get("topic") == "/chat/input":
+                text = n.get("payload", {}).get("text", "").strip()
+                if text:
+                    self.messages.append({"role": "user", "content": text})
+                sid = n.get("payload", {}).get("session_id")
+                if sid:
+                    self.session_id = sid
+            else:
+                other_notifs.append(n)
+
+        if not self.messages:
             return
 
-        if self._processing:
-            logger.warning("Already processing a message — ignoring concurrent input")
-            return
-
-        # Update session_id if provided by frontend
-        if session_id:
-            self.session_id = session_id
-
-        self._processing = True
-        try:
-            await self._agentic_loop(user_text)
-        except Exception as e:
-            logger.error(f"Agentic loop error: {e}", exc_info=True)
-            # Send error message to frontend
-            await self.publish("/chat/output", {
-                "text": f"⚠️ Error: {e}",
-                "session_id": self.session_id,
-            })
-        finally:
-            self._processing = False
-
-    async def _agentic_loop(self, user_text: str):
-        """
-        Core agentic loop:
-        1. Append user message to context
-        2. Call inference → get completion
-        3. If tool_calls: execute tools → append results → re-infer (loop)
-        4. If no tool_calls: publish final reply → done
-        """
-        # Step 1: Append user message
-        self.messages.append({"role": "user", "content": user_text})
-        await self._publish_memory()
-
-        # Step 2-4: Inference loop
+        # --- Phase 3: inference + tool loop ---
         for round_num in range(MAX_TOOL_ROUNDS):
-            # Call Inference Node
-            inference_payload = {
-                "model": self.model,
-                "messages": self.messages,
-            }
+            ctx = build_context(
+                self.system_prompt,
+                self.messages,
+                other_notifs if round_num == 0 else [],
+            )
+
+            request = {"model": self.model, "messages": ctx}
             if self.openai_tools:
-                inference_payload["tools"] = self.openai_tools
+                request["tools"] = self.openai_tools
 
-            logger.info(f"Calling inference (round {round_num + 1})...")
-            result = await self.call_service("/inference/chat", inference_payload, timeout=120)
-
+            logger.info("Inference round %d...", round_num + 1)
+            result = await self.call_service(
+                "/inference/chat", request, timeout=120,
+            )
             if "error" in result:
-                raise RuntimeError(f"Inference error: {result['error']}")
+                raise RuntimeError(f"Inference: {result['error']}")
 
-            # Extract assistant message
-            choice = result["choices"][0]
-            assistant_msg = choice["message"]
-
-            # Append assistant message to context
+            assistant_msg = result["choices"][0]["message"]
             self.messages.append(assistant_msg)
-            await self._publish_memory()
 
-            # Check for tool calls
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
-                # No tool calls — we have the final answer
+                # --- Phase 4: final reply ---
                 content = assistant_msg.get("content", "")
-                logger.info(f"Final reply (round {round_num + 1}): {content[:80]}...")
+                logger.info("Reply (round %d): %.80s...", round_num + 1, content)
                 await self.publish("/chat/output", {
                     "text": content,
                     "session_id": self.session_id,
                 })
+                await self.publish("/memory/latest", {
+                    "session_id": self.session_id,
+                    "messages": self.messages,
+                })
                 return
 
-            # Execute tool calls
-            logger.info(f"Tool calls in round {round_num + 1}: "
-                        f"{[tc['function']['name'] for tc in tool_calls]}")
-
-            for tool_call in tool_calls:
-                tc_id = tool_call["id"]
-                func_name = tool_call["function"]["name"]
-                func_args_str = tool_call["function"].get("arguments", "{}")
-
-                # Parse arguments
-                try:
-                    func_args = json.loads(func_args_str) if isinstance(func_args_str, str) else func_args_str
-                except json.JSONDecodeError:
-                    func_args = {}
-
-                # Execute via MCP
-                tool_result_text = await self._execute_tool(func_name, func_args)
-
-                # Append tool result to context
+            # Execute tool calls via MCP
+            logger.info("Tools: %s",
+                        [tc["function"]["name"] for tc in tool_calls])
+            for tc in tool_calls:
+                name = tc["function"]["name"]
+                args_str = tc["function"].get("arguments", "{}")
+                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                tool_result = await self._call_tool(name, args)
                 self.messages.append({
                     "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": tool_result_text,
+                    "tool_call_id": tc["id"],
+                    "content": tool_result,
                 })
 
-            await self._publish_memory()
-            # Loop continues → re-infer with tool results
-
         # Safety: exceeded max rounds
-        logger.warning(f"Exceeded max tool rounds ({MAX_TOOL_ROUNDS})")
         await self.publish("/chat/output", {
             "text": "⚠️ Exceeded maximum tool call rounds.",
             "session_id": self.session_id,
         })
 
-    async def _execute_tool(self, name: str, arguments: dict) -> str:
-        """Execute a tool via the MCP session."""
-        if not self._mcp_session:
-            return f"Error: MCP session not available, cannot call tool '{name}'"
-
-        try:
-            logger.info(f"Executing tool: {name}({arguments})")
-            result = await self._mcp_session.call_tool(name, arguments=arguments)
-
-            # Extract text from result content
-            texts = []
-            for content_block in result.content:
-                if hasattr(content_block, "text"):
-                    texts.append(content_block.text)
-                else:
-                    texts.append(str(content_block))
-
-            tool_output = "\n".join(texts)
-            logger.info(f"Tool result: {tool_output[:100]}...")
-            return tool_output
-
-        except Exception as e:
-            logger.error(f"Tool execution error ({name}): {e}")
-            return f"Error executing tool '{name}': {e}"
-
-    async def _publish_memory(self):
-        """Publish current conversation state to /memory/latest."""
-        await self.publish("/memory/latest", {
-            "session_id": self.session_id,
-            "messages": self.messages,
-        })
-
-    async def on_shutdown(self):
-        """Clean up MCP session."""
-        if self._mcp_task and not self._mcp_task.done():
-            self._mcp_task.cancel()
+    async def _call_tool(self, name: str, arguments: dict) -> str:
+        """Execute a tool via the first MCP session that can handle it."""
+        for session in self._mcp_sessions.values():
             try:
-                await self._mcp_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Agent shut down.")
+                result = await session.call_tool(name, arguments=arguments)
+                return "\n".join(
+                    b.text if hasattr(b, "text") else str(b)
+                    for b in result.content
+                )
+            except Exception:
+                continue
+        return f"Error: no MCP server can execute tool '{name}'"
 
 
 async def main():
-    agent = ChatbotAgent()
+    agent = AgentNode()
     await agent.bringup()
     await agent.spin()
 

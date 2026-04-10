@@ -9,4 +9,4 @@ type = "executable"
 node = "client:main"
 
 [dependencies]
-python = ["mcp", "anyio"]
+python = ["mcp", "anyio", "tagentacle-py-inferencemux"]

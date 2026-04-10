@@ -208,21 +208,21 @@ wheels = [
 
 [[package]]
 name = "example-agent"
-version = "0.1.0"
+version = "0.2.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "anyio" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "tagentacle-py-core" },
-    { name = "tagentacle-py-mcp" },
+    { name = "tagentacle-py-inferencemux" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio", specifier = ">=4.0" },
-    { name = "mcp", specifier = ">=1.0" },
-    { name = "tagentacle-py-core", editable = "../python-sdk-core" },
-    { name = "tagentacle-py-mcp", editable = "../python-sdk-mcp" },
+    { name = "httpx", specifier = ">=0.24" },
+    { name = "mcp", specifier = ">=1.8" },
+    { name = "tagentacle-py-core", editable = "../tagentacle-py-core" },
+    { name = "tagentacle-py-inferencemux", editable = "../tagentacle-py-inferencemux" },
 ]
 
 [[package]]
@@ -718,25 +718,24 @@ wheels = [
 
 [[package]]
 name = "tagentacle-py-core"
-version = "0.1.0"
-source = { editable = "../python-sdk-core" }
+version = "0.3.0"
+source = { editable = "../tagentacle-py-core" }
+
+[package.metadata]
+requires-dist = [{ name = "jsonschema", marker = "extra == 'validation'", specifier = ">=4.0" }]
+provides-extras = ["validation"]
 
 [[package]]
-name = "tagentacle-py-mcp"
+name = "tagentacle-py-inferencemux"
 version = "0.1.0"
-source = { editable = "../python-sdk-mcp" }
-dependencies = [
-    { name = "anyio" },
-    { name = "mcp" },
-    { name = "tagentacle-py-core" },
-]
+source = { editable = "../tagentacle-py-inferencemux" }
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio", specifier = ">=4.0" },
-    { name = "mcp", specifier = ">=1.0" },
-    { name = "tagentacle-py-core", editable = "../python-sdk-core" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "typing-extensions"
