@@ -216,23 +216,36 @@ class AgentNode(LifecycleNode):
             self._mcp_sessions.pop(server_id, None)
 
     def _start_mcp_session(self, server_id: str, url: str):
-        """Start an MCP client session in the background."""
+        """Start an MCP client session in the background with retry."""
+        if server_id in self._mcp_sessions:
+            return  # already connected
+
         async def _loop():
-            try:
-                async with streamable_http_client(url) as (r, w, _):
-                    async with ClientSession(r, w) as session:
-                        await session.initialize()
-                        self._mcp_sessions[server_id] = session
-                        await self._refresh_tools()
-                        logger.info("MCP ready: %s (%d tools)",
-                                    server_id, len(self.openai_tools))
-                        await asyncio.Future()  # keep alive
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.error("MCP error (%s): %s", server_id, e)
-            finally:
-                self._mcp_sessions.pop(server_id, None)
+            max_retries = 10
+            for attempt in range(max_retries):
+                try:
+                    async with streamable_http_client(url) as (r, w, _):
+                        async with ClientSession(r, w) as session:
+                            await session.initialize()
+                            self._mcp_sessions[server_id] = session
+                            await self._refresh_tools()
+                            logger.info("MCP ready: %s (%d tools)",
+                                        server_id, len(self.openai_tools))
+                            await asyncio.Future()  # keep alive
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    self._mcp_sessions.pop(server_id, None)
+                    if attempt < max_retries - 1:
+                        delay = min(2 ** attempt, 10)
+                        logger.warning("MCP connect failed (%s), retry %d/%d in %ds: %s",
+                                       server_id, attempt + 1, max_retries, delay, e)
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error("MCP connect gave up (%s) after %d retries: %s",
+                                     server_id, max_retries, e)
+                finally:
+                    self._mcp_sessions.pop(server_id, None)
 
         self._mcp_tasks.append(asyncio.create_task(_loop()))
 
