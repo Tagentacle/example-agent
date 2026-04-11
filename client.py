@@ -53,14 +53,16 @@ def mcp_tools_to_openai_schema(mcp_tools) -> list[dict]:
         schema = tool.inputSchema or {"type": "object", "properties": {}}
         if "properties" not in schema:
             schema["properties"] = {}
-        result.append({
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": schema,
-            },
-        })
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": schema,
+                },
+            }
+        )
     return result
 
 
@@ -82,10 +84,12 @@ def build_context(
             topic = n.get("topic", "?")
             payload = {k: v for k, v in n.items() if k not in ("topic", "ts")}
             parts.append(f"[{topic}] {json.dumps(payload, ensure_ascii=False)}")
-        ctx.append({
-            "role": "system",
-            "content": "New bus notifications:\n" + "\n".join(parts),
-        })
+        ctx.append(
+            {
+                "role": "system",
+                "content": "New bus notifications:\n" + "\n".join(parts),
+            }
+        )
     return ctx
 
 
@@ -142,9 +146,13 @@ class AgentNode(LifecycleNode):
         if "extra_subscribe" in config:
             self._extra_subscribe = config["extra_subscribe"]
         self._target_server = config.get("mcp_server_id")
-        logger.info("Agent configured: model=%s session=%s input=%s output=%s",
-                     self.model, self.session_id,
-                     self._input_topic, self._output_topic)
+        logger.info(
+            "Agent configured: model=%s session=%s input=%s output=%s",
+            self.model,
+            self.session_id,
+            self._input_topic,
+            self._output_topic,
+        )
 
     async def on_activate(self):
         # Mailbox subscription — callback only pushes to inbox
@@ -159,10 +167,13 @@ class AgentNode(LifecycleNode):
         async def _on_directory(msg):
             await self._handle_directory(msg)
 
-        # Auto-connect from env
+        # Auto-connect from env (fallback for simple setups)
         server_url = os.environ.get("MCP_SERVER_URL")
         if server_url:
             self._start_mcp_session("env_server", server_url)
+
+        # Active discovery: query existing MCP servers via their services
+        asyncio.create_task(self._discover_existing_servers())
 
         # Start inference loop
         self._inference_task = asyncio.create_task(self._inference_loop())
@@ -215,6 +226,33 @@ class AgentNode(LifecycleNode):
             self._server_urls.pop(server_id, None)
             self._mcp_sessions.pop(server_id, None)
 
+    async def _discover_existing_servers(self):
+        """Pull-based discovery: query gateway for all known MCP servers."""
+        try:
+            resp = await self.call_service(
+                "/mcp/gateway/list_servers",
+                {},
+                timeout=10.0,
+            )
+            servers = resp.get("servers", []) if isinstance(resp, dict) else []
+            for entry in servers:
+                server_id = entry.get("server_id")
+                url = entry.get("url")
+                if not server_id or not url:
+                    continue
+                if entry.get("status") not in ("available", None):
+                    continue
+                if self._target_server is not None and server_id != self._target_server:
+                    continue
+                if server_id not in self._mcp_sessions:
+                    self._server_urls[server_id] = url
+                    self._start_mcp_session(server_id, url)
+                    logger.info(
+                        "Discovered (pull) MCP server: %s at %s", server_id, url
+                    )
+        except Exception as e:
+            logger.info("MCP pull-discovery skipped (gateway not ready): %s", e)
+
     def _start_mcp_session(self, server_id: str, url: str):
         """Start an MCP client session in the background with retry."""
         if server_id in self._mcp_sessions:
@@ -229,21 +267,34 @@ class AgentNode(LifecycleNode):
                             await session.initialize()
                             self._mcp_sessions[server_id] = session
                             await self._refresh_tools()
-                            logger.info("MCP ready: %s (%d tools)",
-                                        server_id, len(self.openai_tools))
+                            logger.info(
+                                "MCP ready: %s (%d tools)",
+                                server_id,
+                                len(self.openai_tools),
+                            )
                             await asyncio.Future()  # keep alive
                 except asyncio.CancelledError:
                     return
                 except Exception as e:
                     self._mcp_sessions.pop(server_id, None)
                     if attempt < max_retries - 1:
-                        delay = min(2 ** attempt, 10)
-                        logger.warning("MCP connect failed (%s), retry %d/%d in %ds: %s",
-                                       server_id, attempt + 1, max_retries, delay, e)
+                        delay = min(2**attempt, 10)
+                        logger.warning(
+                            "MCP connect failed (%s), retry %d/%d in %ds: %s",
+                            server_id,
+                            attempt + 1,
+                            max_retries,
+                            delay,
+                            e,
+                        )
                         await asyncio.sleep(delay)
                     else:
-                        logger.error("MCP connect gave up (%s) after %d retries: %s",
-                                     server_id, max_retries, e)
+                        logger.error(
+                            "MCP connect gave up (%s) after %d retries: %s",
+                            server_id,
+                            max_retries,
+                            e,
+                        )
                 finally:
                     self._mcp_sessions.pop(server_id, None)
 
@@ -272,10 +323,13 @@ class AgentNode(LifecycleNode):
                 await self._run_inference_cycle(signal)
             except Exception as e:
                 logger.error("Inference cycle error: %s", e, exc_info=True)
-                await self.publish(self._output_topic, {
-                    "text": f"⚠️ Error: {e}",
-                    "session_id": self.session_id,
-                })
+                await self.publish(
+                    self._output_topic,
+                    {
+                        "text": f"⚠️ Error: {e}",
+                        "session_id": self.session_id,
+                    },
+                )
             finally:
                 self.mux.release()
 
@@ -320,7 +374,9 @@ class AgentNode(LifecycleNode):
 
             logger.info("Inference round %d...", round_num + 1)
             result = await self.call_service(
-                "/inference/chat", request, timeout=120,
+                "/inference/chat",
+                request,
+                timeout=120,
             )
             if "error" in result:
                 raise RuntimeError(f"Inference: {result['error']}")
@@ -333,35 +389,45 @@ class AgentNode(LifecycleNode):
                 # --- Phase 4: final reply ---
                 content = assistant_msg.get("content", "")
                 logger.info("Reply (round %d): %.80s...", round_num + 1, content)
-                await self.publish(self._output_topic, {
-                    "text": content,
-                    "session_id": self.session_id,
-                })
-                await self.publish("/memory/latest", {
-                    "session_id": self.session_id,
-                    "messages": self.messages,
-                })
+                await self.publish(
+                    self._output_topic,
+                    {
+                        "text": content,
+                        "session_id": self.session_id,
+                    },
+                )
+                await self.publish(
+                    "/memory/latest",
+                    {
+                        "session_id": self.session_id,
+                        "messages": self.messages,
+                    },
+                )
                 return
 
             # Execute tool calls via MCP
-            logger.info("Tools: %s",
-                        [tc["function"]["name"] for tc in tool_calls])
+            logger.info("Tools: %s", [tc["function"]["name"] for tc in tool_calls])
             for tc in tool_calls:
                 name = tc["function"]["name"]
                 args_str = tc["function"].get("arguments", "{}")
                 args = json.loads(args_str) if isinstance(args_str, str) else args_str
                 tool_result = await self._call_tool(name, args)
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": tool_result,
-                })
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": tool_result,
+                    }
+                )
 
         # Safety: exceeded max rounds
-        await self.publish(self._output_topic, {
-            "text": "⚠️ Exceeded maximum tool call rounds.",
-            "session_id": self.session_id,
-        })
+        await self.publish(
+            self._output_topic,
+            {
+                "text": "⚠️ Exceeded maximum tool call rounds.",
+                "session_id": self.session_id,
+            },
+        )
 
     async def _call_tool(self, name: str, arguments: dict) -> str:
         """Execute a tool via the first MCP session that can handle it."""
@@ -369,8 +435,7 @@ class AgentNode(LifecycleNode):
             try:
                 result = await session.call_tool(name, arguments=arguments)
                 return "\n".join(
-                    b.text if hasattr(b, "text") else str(b)
-                    for b in result.content
+                    b.text if hasattr(b, "text") else str(b) for b in result.content
                 )
             except Exception:
                 continue
@@ -389,17 +454,21 @@ async def main():
             config.setdefault("input_topic", "/agent/b/input")
             config.setdefault("output_topic", "/agent/b/output")
             config.setdefault("extra_subscribe", ["/agent/a/output"])
-            config.setdefault("system_prompt",
+            config.setdefault(
+                "system_prompt",
                 "You are Agent B, an executor. You receive tasks from Agent A "
                 "and execute them using available tools. Report results back. "
-                "Always respond in the same language as the input.")
+                "Always respond in the same language as the input.",
+            )
         elif role == "coordinator":
             config.setdefault("extra_subscribe", ["/agent/b/output"])
-            config.setdefault("system_prompt",
+            config.setdefault(
+                "system_prompt",
                 "You are Agent A, a coordinator. You receive user requests and "
                 "can delegate tasks to Agent B by publishing to /agent/b/input. "
                 "You have access to tools. Always respond in the same language "
-                "as the user.")
+                "as the user.",
+            )
 
     await agent.bringup(config)
     await agent.spin()
