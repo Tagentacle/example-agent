@@ -1,18 +1,27 @@
 """
-Tagentacle AgentNode — mailbox-based agentic loop.
+Tagentacle AgentNode — inbox-as-resource agentic loop.
 
-Architecture (new_agent_node.md / Q27 邮箱模型):
-  Inbox (core): per-topic message buffer — callbacks only push, no logic
+Architecture:
+  InboxMCP (tagentacle-py-mcp): per-topic message buffer with dual access —
+    MCP tools for the LLM, Python API for in-process consumers.
+    No HTTP server; FastMCP is used only for tool schema registration.
   InferenceMux (inferencemux): IDLE/BUSY state machine + followup queue
   MCP Client: connects to external MCP servers for tool execution
-  build_context(): pure function — messages + notifications → LLM context
+  build_context(): pure function — system prompt + trigger reason → LLM context
   _run_inference_cycle(): the sole orchestrator
 
 Data flow:
-  bus message → subscribe callback → inbox.push()
-    → mux.trigger() → _run_inference_cycle()
-    → inbox.drain() → build_context() → call_service(/inference/chat)
-    → tool_calls (MCP) → publish(/chat/output)
+  bus message → subscribe callback → mailbox.push()
+    → mux.trigger(detail=topic) → _run_inference_cycle()
+    → build_context(trigger_detail) → call_service(/inference/chat)
+    → LLM calls poll_messages (local) / external tools (MCP)
+    → publish(/chat/output)
+
+Key design:
+  The LLM context contains ONLY the trigger reason (e.g. "new message on
+  /chat/input"). The LLM autonomously decides whether to read the inbox
+  via the poll_messages tool. User messages are never injected directly
+  into the context — the agent reads them as a resource.
 
 MCP Server discovery:
   Subscribes to /mcp/directory (infrastructure, not in inbox).
@@ -25,10 +34,12 @@ import logging
 import os
 import uuid
 
-from tagentacle_py_core import LifecycleNode, Inbox, TopicMode
+from tagentacle_py_core import LifecycleNode
 from tagentacle_py_inferencemux import InferenceMux, TriggerSignal
+from tagentacle_py_mcp import InboxMCP
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,11 +47,119 @@ logger = logging.getLogger(__name__)
 # --- Configuration defaults ---
 DEFAULT_MODEL = os.environ.get("INFERENCE_MODEL", "moonshotai/kimi-k2.5")
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful AI assistant. You have access to tools that you can use "
-    "to help answer questions. When a user asks about the weather, use the "
-    "get_weather tool. Always respond in the same language as the user."
+    "You are a helpful AI assistant running inside a Tagentacle agent node.\n\n"
+    "## Mailbox\n"
+    "You have a mailbox that buffers messages from bus topics. Each inference "
+    "cycle, you receive a trigger reason telling you WHY you were woken up "
+    "(e.g. a new message arrived on a topic, or a timer fired). Your mailbox "
+    "tools let you inspect and consume messages:\n"
+    "- **poll_messages**: Read and drain buffered messages from a topic (or all topics).\n"
+    "- **subscribe_topic**: Subscribe to a new bus topic.\n"
+    "- **set_subscription_level**: Change a topic between 'trigger' and 'silent'.\n"
+    "- **unsubscribe_topic**: Unsubscribe from a topic.\n\n"
+    "When triggered, first call poll_messages to read what arrived, then decide "
+    "how to respond. Always respond in the same language as the user."
 )
 MAX_TOOL_ROUNDS = 10
+
+
+# --- Mailbox tool schemas (OpenAI function-calling format) ---
+
+_MAILBOX_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "poll_messages",
+            "description": (
+                "Read and drain buffered messages from the mailbox. "
+                "Returns up to `limit` messages and removes them from the buffer. "
+                "If topic is omitted, polls all subscribed topics."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic path to poll (e.g. '/chat/input'). Omit to poll all.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages to return (default 50).",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subscribe_topic",
+            "description": (
+                "Subscribe to a Tagentacle bus topic and start buffering "
+                "incoming messages. Use poll_messages to read buffered messages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic path, e.g. '/sensor/data'.",
+                    },
+                    "level": {
+                        "type": "string",
+                        "description": "'trigger' (notify on message) or 'silent' (buffer only). Default: 'trigger'.",
+                    },
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_subscription_level",
+            "description": (
+                "Change subscription level for an already-subscribed topic. "
+                "'trigger' sends notifications on new messages; 'silent' buffers only."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic path.",
+                    },
+                    "level": {
+                        "type": "string",
+                        "description": "'trigger' or 'silent'.",
+                    },
+                },
+                "required": ["topic", "level"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unsubscribe_topic",
+            "description": "Unsubscribe from a topic and clear its message buffer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Topic path to unsubscribe from.",
+                    },
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+]
+
+_MAILBOX_TOOL_NAMES: set[str] = {
+    t["function"]["name"] for t in _MAILBOX_TOOLS
+}
 
 
 # --- Utilities ---
@@ -68,28 +187,23 @@ def mcp_tools_to_openai_schema(mcp_tools) -> list[dict]:
 
 def build_context(
     system_prompt: str,
-    messages: list[dict],
-    notifications: list[dict],
+    cycle_messages: list[dict],
+    trigger_detail: str,
 ) -> list[dict]:
-    """Pure function: render LLM context from conversation + notifications.
+    """Pure function: render LLM context from system prompt + trigger reason.
 
-    Notifications (new inbox items since last cycle) are injected as a system
-    message so the LLM sees ambient information without explicit user input.
+    The LLM receives only the trigger reason — it must use mailbox tools
+    (poll_messages) to read actual message content autonomously.
     """
     ctx = [{"role": "system", "content": system_prompt}]
-    ctx.extend(messages)
-    if notifications:
-        parts = []
-        for n in notifications:
-            topic = n.get("topic", "?")
-            payload = {k: v for k, v in n.items() if k not in ("topic", "ts")}
-            parts.append(f"[{topic}] {json.dumps(payload, ensure_ascii=False)}")
+    if trigger_detail:
         ctx.append(
             {
                 "role": "system",
-                "content": "New bus notifications:\n" + "\n".join(parts),
+                "content": f"Inference triggered by: {trigger_detail}",
             }
         )
+    ctx.extend(cycle_messages)
     return ctx
 
 
@@ -97,11 +211,16 @@ def build_context(
 
 
 class AgentNode(LifecycleNode):
-    """Mailbox-based agent with InferenceMux trigger control.
+    """Inbox-as-resource agent with InferenceMux trigger control.
 
     The agent NEVER writes business logic in bus callbacks.
-    All callbacks do one thing: push to inbox.  InferenceMux controls
-    when to drain the inbox and run an inference cycle.
+    All callbacks do one thing: push to mailbox.  InferenceMux controls
+    when to run an inference cycle.
+
+    The LLM context contains only the trigger reason.  The LLM reads
+    the inbox autonomously via built-in mailbox tools (poll_messages, etc.).
+    InboxMCP provides dual access: MCP tool schemas for the LLM,
+    Python API for in-process consumers — no HTTP server needed.
 
     Supports multiple instances via config:
       node_id, input_topic, output_topic, system_prompt
@@ -109,11 +228,12 @@ class AgentNode(LifecycleNode):
 
     def __init__(self, node_id: str = "agent_node"):
         super().__init__(node_id)
-        self.inbox = Inbox()
+        # InboxMCP: in-process mailbox with MCP tool schemas (no HTTP)
+        self._fastmcp = FastMCP(name=node_id)
+        self.mailbox = InboxMCP(self, self._fastmcp)
         self.mux = InferenceMux()
 
-        # Conversation state
-        self.messages: list[dict] = []
+        # Session state (no cross-cycle conversation history)
         self.session_id: str = str(uuid.uuid4())[:8]
         self.model: str = DEFAULT_MODEL
         self.system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -123,7 +243,7 @@ class AgentNode(LifecycleNode):
         self._output_topic: str = "/chat/output"
         self._extra_subscribe: list[str] = []
 
-        # MCP client state
+        # MCP client state (external servers)
         self.openai_tools: list[dict] = []
         self._mcp_sessions: dict[str, ClientSession] = {}
         self._mcp_tasks: list[asyncio.Task] = []
@@ -155,12 +275,12 @@ class AgentNode(LifecycleNode):
         )
 
     async def on_activate(self):
-        # Mailbox subscription — callback only pushes to inbox
-        self._subscribe_mailbox(self._input_topic, TopicMode.FOLLOWUP)
+        # Mailbox subscription — callback only pushes to mailbox
+        self._subscribe_mailbox(self._input_topic, "trigger")
 
         # Extra subscriptions (e.g. /agent/b/output for cross-agent communication)
         for topic in self._extra_subscribe:
-            self._subscribe_mailbox(topic, TopicMode.FOLLOWUP)
+            self._subscribe_mailbox(topic, "trigger")
 
         # Infrastructure subscription — not in inbox, handled directly
         @self.subscribe("/mcp/directory")
@@ -174,6 +294,9 @@ class AgentNode(LifecycleNode):
 
         # Active discovery: query existing MCP servers via their services
         asyncio.create_task(self._discover_existing_servers())
+
+        # Ensure mailbox tools are always available (even before MCP connects)
+        self.openai_tools = list(_MAILBOX_TOOLS)
 
         # Start inference loop
         self._inference_task = asyncio.create_task(self._inference_loop())
@@ -190,19 +313,21 @@ class AgentNode(LifecycleNode):
     # Mailbox wiring
     # ------------------------------------------------------------------
 
-    def _subscribe_mailbox(self, topic: str, mode: TopicMode):
+    def _subscribe_mailbox(self, topic: str, level: str = "trigger"):
         """Subscribe to a bus topic using the mailbox pattern.
 
-        The callback does exactly ONE thing: push to inbox.
-        If mode is FOLLOWUP, it also triggers InferenceMux.
+        The callback does exactly ONE thing: push to mailbox.
+        If level is 'trigger', it also triggers InferenceMux with
+        the topic name as detail.
         """
-        self.inbox.set_mode(topic, mode)
+        self.mailbox._subscribed_topics.setdefault(topic, [])
+        self.mailbox._subscription_levels[topic] = level
 
         @self.subscribe(topic)
         async def _on_message(msg, _topic=topic):
-            should_trigger = self.inbox.push(_topic, msg)
+            should_trigger = self.mailbox.push(_topic, msg)
             if should_trigger:
-                await self.mux.trigger(TriggerSignal(topic=_topic))
+                await self.mux.trigger(TriggerSignal(topic=_topic, detail=_topic))
 
     # ------------------------------------------------------------------
     # MCP server discovery + connection
@@ -301,7 +426,7 @@ class AgentNode(LifecycleNode):
         self._mcp_tasks.append(asyncio.create_task(_loop()))
 
     async def _refresh_tools(self):
-        """Collect tools from all connected MCP sessions."""
+        """Collect tools from all connected MCP sessions + built-in mailbox tools."""
         all_tools = []
         for session in self._mcp_sessions.values():
             try:
@@ -309,6 +434,7 @@ class AgentNode(LifecycleNode):
                 all_tools.extend(mcp_tools_to_openai_schema(result.tools))
             except Exception:
                 pass
+        all_tools.extend(_MAILBOX_TOOLS)
         self.openai_tools = all_tools
 
     # ------------------------------------------------------------------
@@ -336,36 +462,20 @@ class AgentNode(LifecycleNode):
     async def _run_inference_cycle(self, trigger: TriggerSignal):
         """One complete inference cycle — the sole orchestrator.
 
-        Phase 1: Drain inbox (take all buffered messages)
-        Phase 2: Extract user input → append to conversation
-        Phase 3: Inference + tool loop
-        Phase 4: Publish final reply
+        Phase 1: Build trigger context (why was the agent woken up?)
+        Phase 2: Inference + tool loop (LLM reads inbox via tools)
+        Phase 3: Publish final reply
         """
-        # --- Phase 1: drain inbox ---
-        notifications = self.inbox.drain()
+        # --- Phase 1: trigger context ---
+        trigger_detail = trigger.detail or "timer"
+        cycle_messages: list[dict] = []
 
-        # --- Phase 2: extract user messages ---
-        other_notifs = []
-        for n in notifications:
-            if n.get("topic") == self._input_topic:
-                text = n.get("payload", {}).get("text", "").strip()
-                if text:
-                    self.messages.append({"role": "user", "content": text})
-                sid = n.get("payload", {}).get("session_id")
-                if sid:
-                    self.session_id = sid
-            else:
-                other_notifs.append(n)
-
-        if not self.messages:
-            return
-
-        # --- Phase 3: inference + tool loop ---
+        # --- Phase 2: inference + tool loop ---
         for round_num in range(MAX_TOOL_ROUNDS):
             ctx = build_context(
                 self.system_prompt,
-                self.messages,
-                other_notifs if round_num == 0 else [],
+                cycle_messages,
+                trigger_detail if round_num == 0 else "",
             )
 
             request = {"model": self.model, "messages": ctx}
@@ -382,11 +492,11 @@ class AgentNode(LifecycleNode):
                 raise RuntimeError(f"Inference: {result['error']}")
 
             assistant_msg = result["choices"][0]["message"]
-            self.messages.append(assistant_msg)
+            cycle_messages.append(assistant_msg)
 
             tool_calls = assistant_msg.get("tool_calls")
             if not tool_calls:
-                # --- Phase 4: final reply ---
+                # --- Phase 3: final reply ---
                 content = assistant_msg.get("content", "")
                 logger.info("Reply (round %d): %.80s...", round_num + 1, content)
                 await self.publish(
@@ -400,19 +510,19 @@ class AgentNode(LifecycleNode):
                     "/memory/latest",
                     {
                         "session_id": self.session_id,
-                        "messages": self.messages,
+                        "messages": cycle_messages,
                     },
                 )
                 return
 
-            # Execute tool calls via MCP
+            # Execute tool calls (mailbox tools local, MCP tools remote)
             logger.info("Tools: %s", [tc["function"]["name"] for tc in tool_calls])
             for tc in tool_calls:
                 name = tc["function"]["name"]
                 args_str = tc["function"].get("arguments", "{}")
                 args = json.loads(args_str) if isinstance(args_str, str) else args_str
                 tool_result = await self._call_tool(name, args)
-                self.messages.append(
+                cycle_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -430,7 +540,9 @@ class AgentNode(LifecycleNode):
         )
 
     async def _call_tool(self, name: str, arguments: dict) -> str:
-        """Execute a tool via the first MCP session that can handle it."""
+        """Route tool call: mailbox tools local, MCP tools remote."""
+        if name in _MAILBOX_TOOL_NAMES:
+            return await self._call_mailbox_tool(name, arguments)
         for session in self._mcp_sessions.values():
             try:
                 result = await session.call_tool(name, arguments=arguments)
@@ -440,6 +552,45 @@ class AgentNode(LifecycleNode):
             except Exception:
                 continue
         return f"Error: no MCP server can execute tool '{name}'"
+
+    async def _call_mailbox_tool(self, name: str, arguments: dict) -> str:
+        """Execute a built-in mailbox tool via InboxMCP Python API."""
+        if name == "poll_messages":
+            topic = arguments.get("topic", "")
+            limit = arguments.get("limit", 50)
+            msgs = self.mailbox.drain(topic, limit=limit)
+            return json.dumps(msgs, ensure_ascii=False, default=str)
+
+        if name == "subscribe_topic":
+            topic = arguments.get("topic", "")
+            level = arguments.get("level", "trigger")
+            if not topic:
+                return json.dumps({"error": "missing 'topic'"})
+            if topic in self.mailbox._subscribed_topics:
+                n = len(self.mailbox._subscribed_topics[topic])
+                return f"Already subscribed to '{topic}'. {n} buffered message(s)."
+            self._subscribe_mailbox(topic, level)
+            return f"Subscribed to '{topic}' (level={level})."
+
+        if name == "set_subscription_level":
+            topic = arguments.get("topic", "")
+            level = arguments.get("level", "trigger")
+            if topic not in self.mailbox._subscribed_topics:
+                return f"Not subscribed to '{topic}'. Subscribe first."
+            old = self.mailbox._subscription_levels.get(topic, "trigger")
+            self.mailbox._subscription_levels[topic] = level
+            return f"Subscription level for '{topic}': {old} → {level}"
+
+        if name == "unsubscribe_topic":
+            topic = arguments.get("topic", "")
+            if topic not in self.mailbox._subscribed_topics:
+                return f"Not subscribed to '{topic}'."
+            count = len(self.mailbox._subscribed_topics.pop(topic, []))
+            self.mailbox._subscription_levels.pop(topic, None)
+            self.subscribers.pop(topic, None)
+            return f"Unsubscribed from '{topic}'. Cleared {count} buffered message(s)."
+
+        return f"Error: unknown mailbox tool '{name}'"
 
 
 async def main():
