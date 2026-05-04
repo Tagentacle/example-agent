@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import uuid
+from typing import Any
 
 from tagentacle_py_core import LifecycleNode
 from tagentacle_py_inferencemux import InferenceMux, TriggerSignal
@@ -40,12 +41,23 @@ from tagentacle_py_mcp import InboxMCP
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.context import RequestContext
+from mcp.types import (
+    CreateMessageRequestParams,
+    CreateMessageResult,
+    ErrorData,
+    TextContent,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Configuration defaults ---
 DEFAULT_MODEL = os.environ.get("INFERENCE_MODEL", "moonshotai/kimi-k2.5")
+# Hard wall-clock cap on a single inference cycle (seconds). Prevents
+# the mux from staying BUSY indefinitely if a tool/LLM hangs.
+INFERENCE_CYCLE_TIMEOUT_S = float(os.environ.get("INFERENCE_CYCLE_TIMEOUT_S", "180"))
+SAMPLING_TIMEOUT_S = float(os.environ.get("SAMPLING_TIMEOUT_S", "120"))
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant running inside a Tagentacle agent node.\n\n"
     "## Mailbox\n"
@@ -157,9 +169,7 @@ _MAILBOX_TOOLS: list[dict] = [
     },
 ]
 
-_MAILBOX_TOOL_NAMES: set[str] = {
-    t["function"]["name"] for t in _MAILBOX_TOOLS
-}
+_MAILBOX_TOOL_NAMES: set[str] = {t["function"]["name"] for t in _MAILBOX_TOOLS}
 
 
 # --- Utilities ---
@@ -246,7 +256,10 @@ class AgentNode(LifecycleNode):
         # MCP client state (external servers)
         self.openai_tools: list[dict] = []
         self._mcp_sessions: dict[str, ClientSession] = {}
-        self._mcp_tasks: list[asyncio.Task] = []
+        # tool_name -> server_id  (built so we route each tool to exactly
+        # one MCP server instead of fan-out / first-match).
+        self._tool_to_server: dict[str, str] = {}
+        self._mcp_tasks: dict[str, asyncio.Task] = {}
         self._server_urls: dict[str, str] = {}
         self._target_server: str | None = None
         self._inference_task: asyncio.Task | None = None
@@ -305,8 +318,9 @@ class AgentNode(LifecycleNode):
     async def on_shutdown(self):
         if self._inference_task:
             self._inference_task.cancel()
-        for t in self._mcp_tasks:
+        for t in self._mcp_tasks.values():
             t.cancel()
+        self.mux.reset()
         logger.info("AgentNode shut down.")
 
     # ------------------------------------------------------------------
@@ -320,8 +334,7 @@ class AgentNode(LifecycleNode):
         If level is 'trigger', it also triggers InferenceMux with
         the topic name as detail.
         """
-        self.mailbox._subscribed_topics.setdefault(topic, [])
-        self.mailbox._subscription_levels[topic] = level
+        self.mailbox.register(topic, level)
 
         @self.subscribe(topic)
         async def _on_message(msg, _topic=topic):
@@ -350,6 +363,10 @@ class AgentNode(LifecycleNode):
         elif status == "unavailable":
             self._server_urls.pop(server_id, None)
             self._mcp_sessions.pop(server_id, None)
+            task = self._mcp_tasks.pop(server_id, None)
+            if task and not task.done():
+                task.cancel()
+            await self._refresh_tools()
 
     async def _discover_existing_servers(self):
         """Pull-based discovery: query gateway for all known MCP servers."""
@@ -380,15 +397,19 @@ class AgentNode(LifecycleNode):
 
     def _start_mcp_session(self, server_id: str, url: str):
         """Start an MCP client session in the background with retry."""
-        if server_id in self._mcp_sessions:
-            return  # already connected
+        if server_id in self._mcp_sessions or server_id in self._mcp_tasks:
+            return  # already connected or connecting
 
         async def _loop():
             max_retries = 10
             for attempt in range(max_retries):
                 try:
                     async with streamable_http_client(url) as (r, w, _):
-                        async with ClientSession(r, w) as session:
+                        async with ClientSession(
+                            r,
+                            w,
+                            sampling_callback=self._handle_sampling,
+                        ) as session:
                             await session.initialize()
                             self._mcp_sessions[server_id] = session
                             await self._refresh_tools()
@@ -402,6 +423,7 @@ class AgentNode(LifecycleNode):
                     return
                 except Exception as e:
                     self._mcp_sessions.pop(server_id, None)
+                    await self._refresh_tools()
                     if attempt < max_retries - 1:
                         delay = min(2**attempt, 10)
                         logger.warning(
@@ -422,20 +444,102 @@ class AgentNode(LifecycleNode):
                         )
                 finally:
                     self._mcp_sessions.pop(server_id, None)
+                    await self._refresh_tools()
 
-        self._mcp_tasks.append(asyncio.create_task(_loop()))
+        self._mcp_tasks[server_id] = asyncio.create_task(_loop())
 
     async def _refresh_tools(self):
-        """Collect tools from all connected MCP sessions + built-in mailbox tools."""
-        all_tools = []
-        for session in self._mcp_sessions.values():
+        """Collect tools from all connected MCP sessions + built-in mailbox tools.
+
+        Also rebuilds ``self._tool_to_server`` so :meth:`_call_tool` can
+        deterministically route a tool name to a specific server.
+        Last-writer wins on duplicate tool names; a warning is logged so
+        operators notice the collision.
+        """
+        all_tools: list[dict] = []
+        seen: dict[str, str] = {}  # tool_name -> server_id
+        for server_id, session in list(self._mcp_sessions.items()):
             try:
                 result = await session.list_tools()
-                all_tools.extend(mcp_tools_to_openai_schema(result.tools))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("MCP list_tools failed (%s): %s", server_id, e)
+                continue
+            for schema in mcp_tools_to_openai_schema(result.tools):
+                name = schema["function"]["name"]
+                if name in seen and seen[name] != server_id:
+                    logger.warning(
+                        "Duplicate MCP tool '%s' on servers %s and %s; routing to %s",
+                        name,
+                        seen[name],
+                        server_id,
+                        server_id,
+                    )
+                seen[name] = server_id
+                all_tools.append(schema)
         all_tools.extend(_MAILBOX_TOOLS)
         self.openai_tools = all_tools
+        self._tool_to_server = seen
+
+    # ------------------------------------------------------------------
+    # MCP sampling — Server-initiated LLM requests routed to /inference/chat
+    # ------------------------------------------------------------------
+
+    async def _handle_sampling(
+        self,
+        ctx: RequestContext[ClientSession, Any],
+        params: CreateMessageRequestParams,
+    ) -> CreateMessageResult | ErrorData:
+        """Sampling callback for MCP servers (e.g. shell-mcp).
+
+        Translates ``CreateMessageRequestParams`` to the OpenAI chat
+        format expected by ``/inference/chat`` and returns the assistant
+        reply as a ``CreateMessageResult``. If the bus service fails,
+        an ``ErrorData`` is returned instead of raising — per MCP spec
+        the server expects either branch.
+        """
+        try:
+            messages: list[dict] = []
+            if params.systemPrompt:
+                messages.append({"role": "system", "content": params.systemPrompt})
+            for sm in params.messages:
+                content = sm.content
+                if isinstance(content, TextContent):
+                    text = content.text
+                else:
+                    # Non-text sampling content (image/audio) is not
+                    # supported by the bus inference service today.
+                    text = getattr(content, "text", "") or ""
+                messages.append({"role": sm.role, "content": text})
+
+            request: dict[str, Any] = {"model": self.model, "messages": messages}
+            if params.maxTokens:
+                request["max_tokens"] = params.maxTokens
+            if params.temperature is not None:
+                request["temperature"] = params.temperature
+            if params.stopSequences:
+                request["stop"] = list(params.stopSequences)
+
+            result = await self.call_service(
+                "/inference/chat",
+                request,
+                timeout=SAMPLING_TIMEOUT_S,
+            )
+            if "error" in result:
+                return ErrorData(code=-32000, message=str(result["error"]))
+
+            choice = result["choices"][0]["message"]
+            text = choice.get("content") or ""
+            stop_reason = result["choices"][0].get("finish_reason") or "endTurn"
+            model = result.get("model", self.model)
+            return CreateMessageResult(
+                role="assistant",
+                content=TextContent(type="text", text=text),
+                model=model,
+                stopReason=stop_reason,
+            )
+        except Exception as e:
+            logger.exception("Sampling handler failed")
+            return ErrorData(code=-32000, message=f"sampling failed: {e}")
 
     # ------------------------------------------------------------------
     # Inference loop — the core of the agent
@@ -446,7 +550,22 @@ class AgentNode(LifecycleNode):
         while True:
             signal = await self.mux.wait()
             try:
-                await self._run_inference_cycle(signal)
+                await asyncio.wait_for(
+                    self._run_inference_cycle(signal),
+                    timeout=INFERENCE_CYCLE_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Inference cycle exceeded wall-clock timeout (%.0fs)",
+                    INFERENCE_CYCLE_TIMEOUT_S,
+                )
+                await self.publish(
+                    self._output_topic,
+                    {
+                        "text": "⚠️ Inference timed out.",
+                        "session_id": self.session_id,
+                    },
+                )
             except Exception as e:
                 logger.error("Inference cycle error: %s", e, exc_info=True)
                 await self.publish(
@@ -540,18 +659,20 @@ class AgentNode(LifecycleNode):
         )
 
     async def _call_tool(self, name: str, arguments: dict) -> str:
-        """Route tool call: mailbox tools local, MCP tools remote."""
+        """Route tool call: mailbox tools local, MCP tools by routing map."""
         if name in _MAILBOX_TOOL_NAMES:
             return await self._call_mailbox_tool(name, arguments)
-        for session in self._mcp_sessions.values():
-            try:
-                result = await session.call_tool(name, arguments=arguments)
-                return "\n".join(
-                    b.text if hasattr(b, "text") else str(b) for b in result.content
-                )
-            except Exception:
-                continue
-        return f"Error: no MCP server can execute tool '{name}'"
+        server_id = self._tool_to_server.get(name)
+        session = self._mcp_sessions.get(server_id) if server_id else None
+        if session is None:
+            return f"Error: no MCP server can execute tool '{name}'"
+        try:
+            result = await session.call_tool(name, arguments=arguments)
+        except Exception as e:
+            return f"Error: tool '{name}' on server '{server_id}' failed: {e}"
+        return "\n".join(
+            b.text if hasattr(b, "text") else str(b) for b in result.content
+        )
 
     async def _call_mailbox_tool(self, name: str, arguments: dict) -> str:
         """Execute a built-in mailbox tool via InboxMCP Python API."""
@@ -566,27 +687,30 @@ class AgentNode(LifecycleNode):
             level = arguments.get("level", "trigger")
             if not topic:
                 return json.dumps({"error": "missing 'topic'"})
-            if topic in self.mailbox._subscribed_topics:
-                n = len(self.mailbox._subscribed_topics[topic])
-                return f"Already subscribed to '{topic}'. {n} buffered message(s)."
+            if self.mailbox.is_subscribed(topic):
+                pending = self.mailbox.pending_for(topic)
+                return (
+                    f"Already subscribed to '{topic}'. {pending} buffered message(s)."
+                )
             self._subscribe_mailbox(topic, level)
             return f"Subscribed to '{topic}' (level={level})."
 
         if name == "set_subscription_level":
             topic = arguments.get("topic", "")
             level = arguments.get("level", "trigger")
-            if topic not in self.mailbox._subscribed_topics:
+            if not self.mailbox.is_subscribed(topic):
                 return f"Not subscribed to '{topic}'. Subscribe first."
-            old = self.mailbox._subscription_levels.get(topic, "trigger")
-            self.mailbox._subscription_levels[topic] = level
+            try:
+                old = self.mailbox.set_level(topic, level)
+            except ValueError as e:
+                return f"Error: {e}"
             return f"Subscription level for '{topic}': {old} → {level}"
 
         if name == "unsubscribe_topic":
             topic = arguments.get("topic", "")
-            if topic not in self.mailbox._subscribed_topics:
+            if not self.mailbox.is_subscribed(topic):
                 return f"Not subscribed to '{topic}'."
-            count = len(self.mailbox._subscribed_topics.pop(topic, []))
-            self.mailbox._subscription_levels.pop(topic, None)
+            count = self.mailbox.forget(topic)
             self.subscribers.pop(topic, None)
             return f"Unsubscribed from '{topic}'. Cleared {count} buffered message(s)."
 
